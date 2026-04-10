@@ -2,7 +2,9 @@
    GeoInsight AI — app.js
    ══════════════════════════════════════════ */
 
-const API_BASE = "http://localhost:8000";   // production'da backend URL ile değiştir
+const API_BASE = window.location.hostname === "localhost"
+  ? "http://localhost:8000"
+  : "https://geoinsight-ai-21jl.onrender.com";
 
 // ── State ────────────────────────────────────────────────────────────────────
 let map, currentMarker, radarChart;
