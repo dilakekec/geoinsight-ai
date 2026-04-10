@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>GeoInsight AI — Lokasyon Analiz Platformu</title>
+
+  <!-- Leaflet -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+  <!-- Leaflet Heat -->
+  <script src="https://unpkg.com/leaflet.heat@0.2.0/dist/leaflet-heat.js"></script>
+
+  <!-- Chart.js -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+<!-- ══════════════ TOP NAV ══════════════ -->
+<header class="topbar">
+  <div class="topbar-brand">
+    <span class="brand-icon">◈</span>
+    <span class="brand-name">GeoInsight <span class="brand-accent">AI</span></span>
+  </div>
+  <div class="topbar-tagline">Coğrafi Veri · Makine Öğrenmesi · Lokasyon İçgörüleri</div>
+  <div class="topbar-actions">
+    <button class="btn-ghost" id="btn-heatmap" title="Isı Haritası">🌡 Isı Haritası</button>
+    <button class="btn-ghost" id="btn-reset">↺ Sıfırla</button>
+  </div>
+</header>
+
+<!-- ══════════════ LAYOUT ══════════════ -->
+<main class="layout">
+
+  <!-- MAP -->
+  <section class="map-wrapper">
+    <div id="map"></div>
+    <div class="map-hint" id="map-hint">
+      <span class="pulse-dot"></span>
+      Harita üzerinde bir noktaya tıklayın veya bölge çizmek için <kbd>Shift + Sürükle</kbd>
+    </div>
+    <div class="map-crosshair" id="crosshair" style="display:none">+</div>
+  </section>
+
+  <!-- SIDE PANEL -->
+  <aside class="panel" id="panel">
+
+    <!-- IDLE STATE -->
+    <div class="panel-idle" id="panel-idle">
+      <div class="idle-icon">🗺</div>
+      <h2>Bölge Seçin</h2>
+      <p>Harita üzerinde herhangi bir koordinata tıklayarak anlık çevresel, risk ve yaşam uygunluğu analizini başlatın.</p>
+      <ul class="feature-list">
+        <li><span class="feat-icon env">🌿</span> Çevresel Kalite Skoru</li>
+        <li><span class="feat-icon risk">⚠️</span> Risk Analizi</li>
+        <li><span class="feat-icon liv">🏙</span> Yaşam Uygunluğu</li>
+        <li><span class="feat-icon ai">🤖</span> AI Önerisi</li>
+      </ul>
+    </div>
+
+    <!-- LOADING STATE -->
+    <div class="panel-loading" id="panel-loading" style="display:none">
+      <div class="spinner"></div>
+      <p>Model çalışıyor…</p>
+      <small id="loading-coords"></small>
+    </div>
+
+    <!-- RESULT STATE -->
+    <div class="panel-result" id="panel-result" style="display:none">
+
+      <div class="result-header">
+        <div>
+          <div class="result-coords" id="result-coords"></div>
+          <div class="result-title">Bölge Analizi</div>
+        </div>
+        <div class="overall-badge" id="overall-badge">
+          <span class="overall-num" id="overall-num">--</span>
+          <span class="overall-label">Genel</span>
+        </div>
+      </div>
+
+      <!-- SCORE CARDS -->
+      <div class="score-grid">
+        <div class="score-card env" id="card-env">
+          <div class="score-card-icon">🌿</div>
+          <div class="score-card-label">Çevre</div>
+          <div class="score-card-value" id="sc-env">--</div>
+          <div class="score-bar"><div class="score-bar-fill env-fill" id="bar-env"></div></div>
+        </div>
+        <div class="score-card risk" id="card-risk">
+          <div class="score-card-icon">⚠️</div>
+          <div class="score-card-label">Güvenlik</div>
+          <div class="score-card-value" id="sc-risk">--</div>
+          <div class="score-bar"><div class="score-bar-fill risk-fill" id="bar-risk"></div></div>
+        </div>
+        <div class="score-card liv" id="card-liv">
+          <div class="score-card-icon">🏙</div>
+          <div class="score-card-label">Yaşam</div>
+          <div class="score-card-value" id="sc-liv">--</div>
+          <div class="score-bar"><div class="score-bar-fill liv-fill" id="bar-liv"></div></div>
+        </div>
+      </div>
+
+      <!-- RADAR CHART -->
+      <div class="chart-section">
+        <div class="section-title">Radar Profili</div>
+        <div class="chart-container">
+          <canvas id="radarChart"></canvas>
+        </div>
+      </div>
+
+      <!-- DETAIL TABS -->
+      <div class="tabs">
+        <button class="tab active" data-tab="env">🌿 Çevre</button>
+        <button class="tab" data-tab="risk">⚠️ Risk</button>
+        <button class="tab" data-tab="liv">🏙 Yaşam</button>
+      </div>
+
+      <div class="tab-content" id="tab-env"></div>
+      <div class="tab-content" id="tab-risk" style="display:none"></div>
+      <div class="tab-content" id="tab-liv" style="display:none"></div>
+
+      <!-- SUMMARY -->
+      <div class="ai-box">
+        <div class="ai-box-header"><span class="ai-chip">AI</span> Analiz Özeti</div>
+        <p id="ai-summary"></p>
+        <div class="ai-recommendation" id="ai-recommendation"></div>
+      </div>
+
+    </div><!-- /panel-result -->
+  </aside>
+</main>
+
+<script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,23 @@
+services:
+  # ── FastAPI Backend ──────────────────────────────────────────────────────────
+  - type: web
+    name: geoinsight-api
+    runtime: python
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.0"
+    healthCheckPath: /health
+
+  # ── Static Frontend ──────────────────────────────────────────────────────────
+  - type: web
+    name: geoinsight-frontend
+    runtime: static
+    rootDir: frontend
+    staticPublishPath: .
+    headers:
+      - path: /*
+        name: Cache-Control
+        value: no-cache
