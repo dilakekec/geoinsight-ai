@@ -1,9 +1,21 @@
+from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import math, hashlib, random
 
-app = FastAPI(title="GeoInsight AI", version="1.0.0")
+from data_loader import load_all, nufus_data, egitim_data
+from geocoder import reverse_geocode
+
+
+# ── Uygulama başlangıcında TÜİK verilerini yükle ─────────────────────────────
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    load_all()
+    yield
+
+
+app = FastAPI(title="GeoInsight AI", version="2.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -12,8 +24,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ─── Schemas ──────────────────────────────────────────────────────────────────
 
+# ── Schemas ───────────────────────────────────────────────────────────────────
 class AnalyzeRequest(BaseModel):
     lat: float
     lng: float
@@ -23,11 +35,13 @@ class MetricDetail(BaseModel):
     label: str
     value: float
     unit: str
-    status: str          # good / moderate / poor
+    status: str
+    source: str = "simüle"   # "TÜİK" veya "simüle"
 
 class AnalyzeResponse(BaseModel):
     lat: float
     lng: float
+    province: str | None = None
     environmental_score: float
     risk_score: float
     livability_score: float
@@ -37,103 +51,187 @@ class AnalyzeResponse(BaseModel):
     livability_details: list[MetricDetail]
     summary: str
     recommendation: str
+    data_note: str
 
-# ─── Deterministic pseudo-ML helper ───────────────────────────────────────────
 
-def _seed_value(lat: float, lng: float, salt: str) -> float:
-    """Repeatable float in [0, 1] for given coordinates + salt."""
+# ── Mock yardımcıları ─────────────────────────────────────────────────────────
+def _seed(lat: float, lng: float, salt: str) -> float:
     key = f"{round(lat, 3)}{round(lng, 3)}{salt}"
     digest = hashlib.md5(key.encode()).hexdigest()
     return int(digest[:8], 16) / 0xFFFFFFFF
 
-def _score(lat: float, lng: float, salt: str, base: float = 0.5, spread: float = 0.45) -> float:
-    raw = _seed_value(lat, lng, salt)
-    # Add slight sine-wave geographic variation
+def _mock_score(lat: float, lng: float, salt: str,
+                base: float = 0.5, spread: float = 0.45) -> float:
+    raw      = _seed(lat, lng, salt)
     geo_wave = (math.sin(lat * 0.3) * math.cos(lng * 0.2) + 1) / 2 * 0.15
-    value = base + (raw - 0.5) * spread * 2 + geo_wave
-    return round(min(max(value, 0.05), 0.99) * 100, 1)   # 0–100
+    value    = base + (raw - 0.5) * spread * 2 + geo_wave
+    return round(min(max(value, 0.05), 0.99) * 100, 1)
 
 def _status(score: float) -> str:
     if score >= 70: return "good"
     if score >= 45: return "moderate"
     return "poor"
 
-# ─── Endpoint ─────────────────────────────────────────────────────────────────
+def _blend(real: float | None, mock: float, weight: float = 0.65) -> float:
+    """Gerçek veri varsa ağırlıklı karıştır (real * weight + mock * (1-weight))."""
+    if real is None:
+        return mock
+    return round(real * weight + mock * (1 - weight), 1)
 
+
+# ── Ana analiz endpoint'i ─────────────────────────────────────────────────────
 @app.post("/analyze", response_model=AnalyzeResponse)
-def analyze(req: AnalyzeRequest):
+async def analyze(req: AnalyzeRequest):
     lat, lng = req.lat, req.lng
 
-    # ── Environmental ────────────────────────────────────────
-    aqi        = _score(lat, lng, "aqi",      base=0.65)
-    green_cov  = _score(lat, lng, "green",    base=0.55)
-    water_qual = _score(lat, lng, "water",    base=0.60)
-    noise_pol  = _score(lat, lng, "noise",    base=0.55)
+    # 1. Reverse geocoding → il adı
+    geo        = await reverse_geocode(lat, lng)
+    province   = geo.get("province") or None
+    il_data    = nufus_data.get(province) if province else None
+    egitim_il  = egitim_data.get(province) if province else None
+
+    # Veri kaynağı notu
+    sources = []
+    if il_data:
+        sources.append("nüfus/ekonomi (TÜİK ADNKS 2025)")
+    if egitim_il:
+        sources.append("eğitim/okuryazarlık (TÜİK 2021)")
+
+    if sources:
+        data_note = (
+            f"{province} için gerçek TÜİK verileri kullanıldı: "
+            + ", ".join(sources)
+            + ". Diğer metrikler simüle edilmiştir."
+        )
+    else:
+        data_note = "Tüm metrikler simüle edilmiştir (gerçek veri değildir)."
+
+    # ── Çevresel ─────────────────────────────────────────────────────────────
+    aqi_mock       = _mock_score(lat, lng, "aqi",   base=0.65)
+    green_mock     = _mock_score(lat, lng, "green", base=0.55)
+    water_mock     = _mock_score(lat, lng, "water", base=0.60)
+    noise_mock     = _mock_score(lat, lng, "noise", base=0.55)
+
+    # Yüksek nüfus yoğunluğu → daha düşük çevre skoru (gerçek etki)
+    if il_data:
+        cevre_penalty = il_data["cevre_penalty"]   # 0–100, yüksek = kötü
+        aqi_real   = round(max(100 - cevre_penalty * 0.6, 20), 1)
+        green_real = round(max(100 - cevre_penalty * 0.5, 15), 1)
+        aqi        = _blend(aqi_real,   aqi_mock)
+        green_cov  = _blend(green_real, green_mock)
+    else:
+        aqi       = aqi_mock
+        green_cov = green_mock
+
+    water_qual = water_mock
+    noise_pol  = noise_mock
     env_score  = round((aqi + green_cov + water_qual + noise_pol) / 4, 1)
+
+    aqi_src   = "TÜİK + simüle" if il_data else "simüle"
+    green_src = "TÜİK + simüle" if il_data else "simüle"
 
     env_details = [
         MetricDetail(label="Hava Kalitesi (AQI)", value=aqi,
-                     unit="puan", status=_status(aqi)),
+                     unit="puan", status=_status(aqi),       source=aqi_src),
         MetricDetail(label="Yeşil Alan Örtüsü",  value=green_cov,
-                     unit="%",    status=_status(green_cov)),
+                     unit="%",    status=_status(green_cov), source=green_src),
         MetricDetail(label="Su Kalitesi",         value=water_qual,
-                     unit="puan", status=_status(water_qual)),
-        MetricDetail(label="Gürültü Kirliliği",   value=100 - noise_pol,
-                     unit="dB indeks", status=_status(100 - noise_pol)),
+                     unit="puan", status=_status(water_qual), source="simüle"),
+        MetricDetail(label="Gürültü Kirliliği",   value=round(100 - noise_pol, 1),
+                     unit="dB indeks", status=_status(100 - noise_pol), source="simüle"),
     ]
 
-    # ── Risk ────────────────────────────────────────────────
-    flood_risk    = _score(lat, lng, "flood",   base=0.35)
-    seismic_risk  = _score(lat, lng, "seismic", base=0.40)
-    fire_risk     = _score(lat, lng, "fire",    base=0.30)
-    infra_risk    = _score(lat, lng, "infra",   base=0.45)
-    # Risk: lower raw → safer → higher safety score
-    risk_score = round(100 - (flood_risk + seismic_risk + fire_risk + infra_risk) / 4, 1)
+    # ── Risk ──────────────────────────────────────────────────────────────────
+    flood_risk   = _mock_score(lat, lng, "flood",   base=0.35)
+    seismic_risk = _mock_score(lat, lng, "seismic", base=0.40)
+    fire_risk    = _mock_score(lat, lng, "fire",    base=0.30)
+    infra_risk   = _mock_score(lat, lng, "infra",   base=0.45)
+    risk_score   = round(100 - (flood_risk + seismic_risk + fire_risk + infra_risk) / 4, 1)
 
     risk_details = [
-        MetricDetail(label="Sel Riski",          value=flood_risk,
-                     unit="puan", status=_status(100 - flood_risk)),
-        MetricDetail(label="Deprem Riski",        value=seismic_risk,
-                     unit="puan", status=_status(100 - seismic_risk)),
-        MetricDetail(label="Yangın Riski",        value=fire_risk,
-                     unit="puan", status=_status(100 - fire_risk)),
-        MetricDetail(label="Altyapı Güvenilirliği", value=infra_risk,
-                     unit="puan", status=_status(infra_risk)),
+        MetricDetail(label="Sel Riski",              value=flood_risk,
+                     unit="puan", status=_status(100 - flood_risk),  source="simüle"),
+        MetricDetail(label="Deprem Riski",            value=seismic_risk,
+                     unit="puan", status=_status(100 - seismic_risk), source="simüle"),
+        MetricDetail(label="Yangın Riski",            value=fire_risk,
+                     unit="puan", status=_status(100 - fire_risk),   source="simüle"),
+        MetricDetail(label="Altyapı Güvenilirliği",  value=infra_risk,
+                     unit="puan", status=_status(infra_risk),        source="simüle"),
     ]
 
-    # ── Livability ──────────────────────────────────────────
-    transport  = _score(lat, lng, "transport", base=0.60)
-    education  = _score(lat, lng, "education", base=0.58)
-    healthcare = _score(lat, lng, "health",    base=0.62)
-    economy    = _score(lat, lng, "economy",   base=0.55)
+    # ── Yaşam Uygunluğu ───────────────────────────────────────────────────────
+    transport_mock  = _mock_score(lat, lng, "transport", base=0.60)
+    education_mock  = _mock_score(lat, lng, "education", base=0.58)
+    healthcare_mock = _mock_score(lat, lng, "health",    base=0.62)
+    economy_mock    = _mock_score(lat, lng, "economy",   base=0.55)
+
+    # Ekonomi: gerçek nüfus yoğunluğu skoru kullan
+    if il_data:
+        economy     = _blend(il_data["ekonomi_score"], economy_mock)
+        economy_src = "TÜİK + simüle"
+    else:
+        economy     = economy_mock
+        economy_src = "simüle"
+
+    transport  = transport_mock
+    if egitim_il:
+        education     = _blend(egitim_il["egitim_score"], education_mock)
+        education_src = "TÜİK + simüle"
+    else:
+        education     = education_mock
+        education_src = "simüle"
+    healthcare = healthcare_mock
     livability_score = round((transport + education + healthcare + economy) / 4, 1)
 
     liv_details = [
         MetricDetail(label="Ulaşım Erişimi",    value=transport,
-                     unit="puan", status=_status(transport)),
+                     unit="puan", status=_status(transport),  source="simüle"),
         MetricDetail(label="Eğitim Kalitesi",   value=education,
-                     unit="puan", status=_status(education)),
+                     unit="puan", status=_status(education),  source=education_src),
         MetricDetail(label="Sağlık Hizmetleri", value=healthcare,
-                     unit="puan", status=_status(healthcare)),
+                     unit="puan", status=_status(healthcare), source="simüle"),
         MetricDetail(label="Ekonomik Canlılık", value=economy,
-                     unit="puan", status=_status(economy)),
+                     unit="puan", status=_status(economy),    source=economy_src),
     ]
 
+    # Okuryazarlık oranı (egitim_il varsa)
+    if egitim_il:
+        liv_details.append(MetricDetail(
+            label="Okuryazarlık Oranı",
+            value=egitim_il["okur_yazarlik_orani"],
+            unit="%",
+            status=_status(egitim_il["egitim_score"]),
+            source="TÜİK 2021",
+        ))
+
+    # Nüfus yoğunluğu bilgi satırı (il_data varsa)
+    if il_data:
+        liv_details.append(MetricDetail(
+            label="Nüfus Yoğunluğu",
+            value=float(il_data["yogunluk"]),
+            unit="kişi/km²",
+            status=_status(min(il_data["ekonomi_score"], 100)),
+            source="TÜİK ADNKS 2025",
+        ))
+
+    # ── Genel skor & özet ─────────────────────────────────────────────────────
     overall = round((env_score + risk_score + livability_score) / 3, 1)
 
-    # ── Narrative ───────────────────────────────────────────
+    province_str = f"{province} ili, " if province else ""
+
     if overall >= 70:
-        summary = "Bu bölge, genel metriklere göre yüksek yaşam kalitesi sunmaktadır."
+        summary        = f"{province_str}bu bölge genel metriklere göre yüksek yaşam kalitesi sunmaktadır."
         recommendation = "Yatırım ve yerleşim için uygun. Çevresel değerlerin korunması önerilir."
     elif overall >= 50:
-        summary = "Bölge orta düzeyde bir profil sergilemektedir; bazı metrikler iyileştirme gerektirmektedir."
+        summary        = f"{province_str}bölge orta düzeyde bir profil sergilemektedir; bazı metrikler iyileştirme gerektirmektedir."
         recommendation = "Riskler ve altyapı eksiklikleri değerlendirildikten sonra karar verilmesi önerilir."
     else:
-        summary = "Bu bölgede belirgin riskler ve düşük yaşam kalitesi metrikleri tespit edilmiştir."
+        summary        = f"{province_str}bu bölgede belirgin riskler ve düşük yaşam kalitesi metrikleri tespit edilmiştir."
         recommendation = "Öncelikli iyileştirme müdahalesi veya alternatif bölge araştırması tavsiye edilir."
 
     return AnalyzeResponse(
         lat=lat, lng=lng,
+        province=province,
         environmental_score=env_score,
         risk_score=risk_score,
         livability_score=livability_score,
@@ -143,22 +241,29 @@ def analyze(req: AnalyzeRequest):
         livability_details=liv_details,
         summary=summary,
         recommendation=recommendation,
+        data_note=data_note,
     )
 
 
+# ── Heatmap ───────────────────────────────────────────────────────────────────
 @app.get("/heatmap-points")
 def heatmap_points():
-    """Sample points for the demo heatmap layer."""
     random.seed(42)
     points = []
     for _ in range(120):
         lat = random.uniform(36.0, 42.0)
         lng = random.uniform(26.0, 45.0)
-        intensity = _seed_value(lat, lng, "heat")
+        digest = hashlib.md5(f"{lat}{lng}heat".encode()).hexdigest()
+        intensity = int(digest[:8], 16) / 0xFFFFFFFF
         points.append({"lat": round(lat, 4), "lng": round(lng, 4), "intensity": round(intensity, 3)})
     return {"points": points}
 
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "GeoInsight AI"}
+    return {
+        "status": "ok",
+        "service": "GeoInsight AI",
+        "tuik_nufus_loaded": nufus_data.loaded,
+        "tuik_egitim_loaded": egitim_data.loaded,
+    }

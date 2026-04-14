@@ -166,8 +166,9 @@ function showResult(data) {
   showPanel("panel-result");
 
   // Header
+  const provinceLabel = data.province ? ` · ${data.province}` : "";
   document.getElementById("result-coords").textContent =
-    `${data.lat.toFixed(5)}°N, ${data.lng.toFixed(5)}°E`;
+    `${data.lat.toFixed(5)}°N, ${data.lng.toFixed(5)}°E${provinceLabel}`;
 
   // Overall badge
   const overall = data.overall_score;
@@ -189,8 +190,22 @@ function showResult(data) {
   renderTab("tab-liv",  data.livability_details);
 
   // AI summary
-  document.getElementById("ai-summary").textContent       = data.summary;
+  document.getElementById("ai-summary").textContent        = data.summary;
   document.getElementById("ai-recommendation").textContent = "💡 " + data.recommendation;
+
+  // Veri kaynağı notu
+  let noteEl = document.getElementById("data-note");
+  if (!noteEl) {
+    noteEl = document.createElement("div");
+    noteEl.id = "data-note";
+    noteEl.style.cssText = `
+      font-size:11px; color:var(--muted); margin-top:4px;
+      padding:8px 12px; background:var(--surface2);
+      border:1px solid var(--border); border-radius:8px; line-height:1.5;
+    `;
+    document.getElementById("ai-recommendation").after(noteEl);
+  }
+  noteEl.textContent = "📊 " + (data.data_note || "");
 
   // Reset tab to env
   switchTab("env");
@@ -281,8 +296,12 @@ function renderTab(containerId, details) {
   details.forEach(d => {
     const row = document.createElement("div");
     row.className = "metric-row";
+    const srcBadge = d.source && d.source !== "simüle"
+      ? `<span style="font-size:9px;background:rgba(88,166,255,.15);color:var(--accent);
+               padding:1px 5px;border-radius:4px;margin-left:4px;">TÜİK</span>`
+      : "";
     row.innerHTML = `
-      <span class="metric-label">${d.label}</span>
+      <span class="metric-label">${d.label}${srcBadge}</span>
       <span class="metric-value" style="color:${metricColor(d.status)}">${d.value}</span>
       <span class="metric-unit">${d.unit}</span>
       <span class="metric-status ${d.status}">${statusLabel(d.status)}</span>
