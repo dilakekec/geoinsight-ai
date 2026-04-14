@@ -2,12 +2,13 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import asyncio, math, hashlib, random
+import asyncio, math, hashlib, random, os
 
 from data_loader import load_all, nufus_data, egitim_data
 from geocoder import reverse_geocode
 from osm_fetcher import fetch_green_coverage
 from kira_loader import kira_data
+from aqi_fetcher import fetch_aqi, _status_pm25
 
 
 # ── Uygulama başlangıcında TÜİK verilerini yükle ─────────────────────────────
@@ -87,11 +88,12 @@ def _blend(real: float | None, mock: float, weight: float = 0.65) -> float:
 async def analyze(req: AnalyzeRequest):
     lat, lng = req.lat, req.lng
 
-    # 1. Reverse geocoding + OSM yeşil alan verisi → paralel çek
+    # 1. Tüm harici API'leri paralel çek (gecikme toplam değil maksimum olur)
     radius_m = int(req.radius_km * 1000)
-    geo, osm = await asyncio.gather(
+    geo, osm, aqi_data = await asyncio.gather(
         reverse_geocode(lat, lng),
         fetch_green_coverage(lat, lng, radius_m),
+        fetch_aqi(lat, lng),
     )
 
     province  = geo.get("province") or None
@@ -102,6 +104,11 @@ async def analyze(req: AnalyzeRequest):
 
     # Veri kaynağı notu
     sources = []
+    if aqi_data["source"] != "simüle":
+        sources.append(
+            f"hava kalitesi ({aqi_data['source']} · AQI {aqi_data['aqi']} · "
+            f"PM2.5 {aqi_data['pm25']} µg/m³)"
+        )
     if osm["source"] == "OSM":
         sources.append(
             f"yeşillik (OSM · {osm['feature_count']} alan · "
@@ -143,8 +150,12 @@ async def analyze(req: AnalyzeRequest):
         green_cov = green_mock
         green_src = "simüle"
 
-    # Hava kalitesi: nüfus yoğunluğu etkisi
-    if il_data:
+    # Hava kalitesi: IQAir/OWM gerçek veri → en güçlü sinyal
+    if aqi_data["score"] is not None:
+        aqi     = _blend(aqi_data["score"], aqi_mock, weight=0.90)
+        aqi_src = aqi_data["source"]
+    elif il_data:
+        # Gerçek API yoksa nüfus yoğunluğundan tahmin
         cevre_penalty = il_data["cevre_penalty"]
         aqi_real      = round(max(100 - cevre_penalty * 0.6, 20), 1)
         aqi           = _blend(aqi_real, aqi_mock)
@@ -173,6 +184,17 @@ async def analyze(req: AnalyzeRequest):
         MetricDetail(label="Gürültü Kirliliği",   value=round(100 - noise_pol, 1),
                      unit="dB indeks", status=_status(100 - noise_pol), source="simüle"),
     ]
+
+    # PM2.5 gerçek konsantrasyon — API varsa ekle
+    if aqi_data["pm25"] is not None:
+        aqi_label = f"AQI {aqi_data['aqi']}" if aqi_data["aqi"] else "PM2.5"
+        env_details.append(MetricDetail(
+            label=f"PM2.5 ({aqi_label})",
+            value=aqi_data["pm25"],
+            unit="µg/m³",
+            status=_status_pm25(aqi_data["pm25"]),
+            source=aqi_data["source"],
+        ))
 
     # ── Risk ──────────────────────────────────────────────────────────────────
     flood_risk   = _mock_score(lat, lng, "flood",   base=0.35)
@@ -328,4 +350,7 @@ def health():
         "tuik_egitim_loaded": egitim_data.loaded,
         "endeksa_kira_loaded": kira_data.loaded,
         "osm_green_cache_size": len(__import__("osm_fetcher")._cache),
+        "aqi_cache_size": len(__import__("aqi_fetcher")._cache),
+        "aqi_source": "IQAir" if os.environ.get("IQAIR_API_KEY") else (
+                       "OpenWeatherMap" if os.environ.get("OWM_API_KEY") else "simüle"),
     }
