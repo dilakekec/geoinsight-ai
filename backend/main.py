@@ -2,10 +2,11 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import math, hashlib, random
+import asyncio, math, hashlib, random
 
 from data_loader import load_all, nufus_data, egitim_data
 from geocoder import reverse_geocode
+from osm_fetcher import fetch_green_coverage
 
 
 # ── Uygulama başlangıcında TÜİK verilerini yükle ─────────────────────────────
@@ -84,14 +85,24 @@ def _blend(real: float | None, mock: float, weight: float = 0.65) -> float:
 async def analyze(req: AnalyzeRequest):
     lat, lng = req.lat, req.lng
 
-    # 1. Reverse geocoding → il adı
-    geo        = await reverse_geocode(lat, lng)
-    province   = geo.get("province") or None
-    il_data    = nufus_data.get(province) if province else None
-    egitim_il  = egitim_data.get(province) if province else None
+    # 1. Reverse geocoding + OSM yeşil alan verisi → paralel çek
+    radius_m = int(req.radius_km * 1000)
+    geo, osm = await asyncio.gather(
+        reverse_geocode(lat, lng),
+        fetch_green_coverage(lat, lng, radius_m),
+    )
+
+    province  = geo.get("province") or None
+    il_data   = nufus_data.get(province) if province else None
+    egitim_il = egitim_data.get(province) if province else None
 
     # Veri kaynağı notu
     sources = []
+    if osm["source"] == "OSM":
+        sources.append(
+            f"yeşillik (OSM · {osm['feature_count']} alan · "
+            f"%{round(osm['coverage_ratio']*100,1)} örtü)"
+        )
     if il_data:
         sources.append("nüfus/ekonomi (TÜİK ADNKS 2025)")
     if egitim_il:
@@ -99,8 +110,8 @@ async def analyze(req: AnalyzeRequest):
 
     if sources:
         data_note = (
-            f"{province} için gerçek TÜİK verileri kullanıldı: "
-            + ", ".join(sources)
+            ("" if not province else f"{province} · ")
+            + "Gerçek veri: " + ", ".join(sources)
             + ". Diğer metrikler simüle edilmiştir."
         )
     else:
@@ -112,29 +123,44 @@ async def analyze(req: AnalyzeRequest):
     water_mock     = _mock_score(lat, lng, "water", base=0.60)
     noise_mock     = _mock_score(lat, lng, "noise", base=0.55)
 
-    # Yüksek nüfus yoğunluğu → daha düşük çevre skoru (gerçek etki)
-    if il_data:
-        cevre_penalty = il_data["cevre_penalty"]   # 0–100, yüksek = kötü
-        aqi_real   = round(max(100 - cevre_penalty * 0.6, 20), 1)
-        green_real = round(max(100 - cevre_penalty * 0.5, 15), 1)
-        aqi        = _blend(aqi_real,   aqi_mock)
-        green_cov  = _blend(green_real, green_mock)
+    # Yeşil alan: OSM gerçek veri varsa kullan, yoksa nüfus yoğunluğu tahminine düş
+    if osm["score"] is not None:
+        green_cov = _blend(osm["score"], green_mock, weight=0.80)
+        green_src = "OSM"
+    elif il_data:
+        cevre_penalty = il_data["cevre_penalty"]
+        green_real    = round(max(100 - cevre_penalty * 0.5, 15), 1)
+        green_cov     = _blend(green_real, green_mock)
+        green_src     = "TÜİK + simüle"
     else:
-        aqi       = aqi_mock
         green_cov = green_mock
+        green_src = "simüle"
+
+    # Hava kalitesi: nüfus yoğunluğu etkisi
+    if il_data:
+        cevre_penalty = il_data["cevre_penalty"]
+        aqi_real      = round(max(100 - cevre_penalty * 0.6, 20), 1)
+        aqi           = _blend(aqi_real, aqi_mock)
+        aqi_src       = "TÜİK + simüle"
+    else:
+        aqi     = aqi_mock
+        aqi_src = "simüle"
 
     water_qual = water_mock
     noise_pol  = noise_mock
     env_score  = round((aqi + green_cov + water_qual + noise_pol) / 4, 1)
 
-    aqi_src   = "TÜİK + simüle" if il_data else "simüle"
-    green_src = "TÜİK + simüle" if il_data else "simüle"
+    # Yeşil alan birim: OSM varsa "puan (OSM)" göster, yoksa skor
+    green_label = "Yeşil Alan Örtüsü"
+    green_unit  = "puan"
+    if osm["source"] == "OSM":
+        green_unit = f"puan · {round(osm['green_area_m2']/1_000_000, 2)} km²"
 
     env_details = [
         MetricDetail(label="Hava Kalitesi (AQI)", value=aqi,
                      unit="puan", status=_status(aqi),       source=aqi_src),
-        MetricDetail(label="Yeşil Alan Örtüsü",  value=green_cov,
-                     unit="%",    status=_status(green_cov), source=green_src),
+        MetricDetail(label=green_label,            value=green_cov,
+                     unit=green_unit, status=_status(green_cov), source=green_src),
         MetricDetail(label="Su Kalitesi",         value=water_qual,
                      unit="puan", status=_status(water_qual), source="simüle"),
         MetricDetail(label="Gürültü Kirliliği",   value=round(100 - noise_pol, 1),
@@ -266,4 +292,5 @@ def health():
         "service": "GeoInsight AI",
         "tuik_nufus_loaded": nufus_data.loaded,
         "tuik_egitim_loaded": egitim_data.loaded,
+        "osm_green_cache_size": len(__import__("osm_fetcher")._cache),
     }
