@@ -10,6 +10,7 @@ from osm_fetcher import fetch_green_coverage
 from kira_loader import kira_data
 from aqi_fetcher import fetch_aqi, _status_pm25
 from security_fetcher import fetch_security
+from traffic_fetcher import fetch_traffic
 
 
 # ── Uygulama başlangıcında TÜİK verilerini yükle ─────────────────────────────
@@ -91,11 +92,12 @@ async def analyze(req: AnalyzeRequest):
 
     # 1. Tüm harici API'leri paralel çek (gecikme toplam değil maksimum olur)
     radius_m = int(req.radius_km * 1000)
-    geo, osm, aqi_data, sec = await asyncio.gather(
+    geo, osm, aqi_data, sec, trf = await asyncio.gather(
         reverse_geocode(lat, lng),
         fetch_green_coverage(lat, lng, radius_m),
         fetch_aqi(lat, lng),
         fetch_security(lat, lng, radius_m),
+        fetch_traffic(lat, lng, radius_m),
     )
 
     province  = geo.get("province") or None
@@ -110,6 +112,11 @@ async def analyze(req: AnalyzeRequest):
         sources.append(
             f"hava kalitesi ({aqi_data['source']} · AQI {aqi_data['aqi']} · "
             f"PM2.5 {aqi_data['pm25']} µg/m³)"
+        )
+    if trf["source"] == "OSM":
+        sources.append(
+            f"ulaşım (OSM · {trf['total_road_km']} km yol · "
+            f"{trf['total_density']} km/km²)"
         )
     if sec["source"] == "OSM":
         sources.append(
@@ -278,7 +285,12 @@ async def analyze(req: AnalyzeRequest):
         economy     = economy_mock
         economy_src = "simüle"
 
-    transport  = transport_mock
+    if trf["score"] is not None:
+        transport     = _blend(trf["score"], transport_mock, weight=0.85)
+        transport_src = "OSM"
+    else:
+        transport     = transport_mock
+        transport_src = "simüle"
     if egitim_il:
         education     = _blend(egitim_il["egitim_score"], education_mock)
         education_src = "TÜİK + simüle"
@@ -290,7 +302,7 @@ async def analyze(req: AnalyzeRequest):
 
     liv_details = [
         MetricDetail(label="Ulaşım Erişimi",    value=transport,
-                     unit="puan", status=_status(transport),  source="simüle"),
+                     unit="puan", status=_status(transport),  source=transport_src),
         MetricDetail(label="Eğitim Kalitesi",   value=education,
                      unit="puan", status=_status(education),  source=education_src),
         MetricDetail(label="Sağlık Hizmetleri", value=healthcare,
@@ -298,6 +310,23 @@ async def analyze(req: AnalyzeRequest):
         MetricDetail(label="Ekonomik Canlılık", value=economy,
                      unit="puan", status=_status(economy),    source=economy_src),
     ]
+
+    # Yol ağı detayları (trf OSM ise)
+    if trf["source"] == "OSM":
+        liv_details.append(MetricDetail(
+            label="Yol Yoğunluğu",
+            value=trf["total_density"],
+            unit="km/km²",
+            status=_status(trf["local_score"]),
+            source="OSM",
+        ))
+        liv_details.append(MetricDetail(
+            label="Ana Arterler",
+            value=trf["artery_km"],
+            unit="km (5 km yarıçap)",
+            status=_status(trf["artery_score"]),
+            source="OSM",
+        ))
 
     # Kira ve konut değeri (kira_il varsa)
     if kira_il:
