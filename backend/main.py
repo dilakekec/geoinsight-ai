@@ -7,12 +7,14 @@ import asyncio, math, hashlib, random
 from data_loader import load_all, nufus_data, egitim_data
 from geocoder import reverse_geocode
 from osm_fetcher import fetch_green_coverage
+from kira_loader import kira_data
 
 
 # ── Uygulama başlangıcında TÜİK verilerini yükle ─────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     load_all()
+    kira_data.load()
     yield
 
 
@@ -93,8 +95,10 @@ async def analyze(req: AnalyzeRequest):
     )
 
     province  = geo.get("province") or None
+    district  = geo.get("district") or ""
     il_data   = nufus_data.get(province) if province else None
     egitim_il = egitim_data.get(province) if province else None
+    kira_il   = kira_data.get(province, district) if province else None
 
     # Veri kaynağı notu
     sources = []
@@ -107,6 +111,9 @@ async def analyze(req: AnalyzeRequest):
         sources.append("nüfus/ekonomi (TÜİK ADNKS 2025)")
     if egitim_il:
         sources.append("eğitim/okuryazarlık (TÜİK 2021)")
+    if kira_il:
+        kira_scope = kira_il["ilce"] if kira_il["ilce"] else kira_il["il"]
+        sources.append(f"kira/konut (Endeksa 2024 · {kira_scope})")
 
     if sources:
         data_note = (
@@ -191,8 +198,18 @@ async def analyze(req: AnalyzeRequest):
     healthcare_mock = _mock_score(lat, lng, "health",    base=0.62)
     economy_mock    = _mock_score(lat, lng, "economy",   base=0.55)
 
-    # Ekonomi: gerçek nüfus yoğunluğu skoru kullan
-    if il_data:
+    # Ekonomi: kira verisi en güçlü sinyal; yoksa nüfus yoğunluğu; yoksa mock
+    if kira_il:
+        # Kira skoru %70 + nüfus skoru %15 + mock %15
+        nufus_econ = il_data["ekonomi_score"] if il_data else economy_mock
+        economy     = round(
+            kira_il["ekonomi_score"] * 0.70
+            + nufus_econ * 0.15
+            + economy_mock * 0.15,
+            1
+        )
+        economy_src = "Endeksa + simüle"
+    elif il_data:
         economy     = _blend(il_data["ekonomi_score"], economy_mock)
         economy_src = "TÜİK + simüle"
     else:
@@ -219,6 +236,23 @@ async def analyze(req: AnalyzeRequest):
         MetricDetail(label="Ekonomik Canlılık", value=economy,
                      unit="puan", status=_status(economy),    source=economy_src),
     ]
+
+    # Kira ve konut değeri (kira_il varsa)
+    if kira_il:
+        liv_details.append(MetricDetail(
+            label="Ortalama Kira",
+            value=round(kira_il["ort_kira_tl"] / 1000, 1),
+            unit="₺k/ay",
+            status=_status(kira_il["ekonomi_score"]),
+            source="Endeksa 2024",
+        ))
+        liv_details.append(MetricDetail(
+            label="Konut m² Fiyatı",
+            value=round(kira_il["m2_fiyat_tl"] / 1000, 1),
+            unit="₺k/m²",
+            status=_status(kira_il["ekonomi_score"]),
+            source="Endeksa 2024",
+        ))
 
     # Okuryazarlık oranı (egitim_il varsa)
     if egitim_il:
@@ -292,5 +326,6 @@ def health():
         "service": "GeoInsight AI",
         "tuik_nufus_loaded": nufus_data.loaded,
         "tuik_egitim_loaded": egitim_data.loaded,
+        "endeksa_kira_loaded": kira_data.loaded,
         "osm_green_cache_size": len(__import__("osm_fetcher")._cache),
     }

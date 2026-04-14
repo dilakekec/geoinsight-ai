@@ -171,3 +171,4 @@ egitim_data = EgitimData()
 def load_all():
     nufus_data.load()
     egitim_data.load()
+    # kira_data kira_loader.py'de ayrı yüklenir (main.py'de çağrılır)
