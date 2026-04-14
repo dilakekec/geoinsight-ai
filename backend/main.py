@@ -9,6 +9,7 @@ from geocoder import reverse_geocode
 from osm_fetcher import fetch_green_coverage
 from kira_loader import kira_data
 from aqi_fetcher import fetch_aqi, _status_pm25
+from security_fetcher import fetch_security
 
 
 # ── Uygulama başlangıcında TÜİK verilerini yükle ─────────────────────────────
@@ -90,10 +91,11 @@ async def analyze(req: AnalyzeRequest):
 
     # 1. Tüm harici API'leri paralel çek (gecikme toplam değil maksimum olur)
     radius_m = int(req.radius_km * 1000)
-    geo, osm, aqi_data = await asyncio.gather(
+    geo, osm, aqi_data, sec = await asyncio.gather(
         reverse_geocode(lat, lng),
         fetch_green_coverage(lat, lng, radius_m),
         fetch_aqi(lat, lng),
+        fetch_security(lat, lng, radius_m),
     )
 
     province  = geo.get("province") or None
@@ -108,6 +110,11 @@ async def analyze(req: AnalyzeRequest):
         sources.append(
             f"hava kalitesi ({aqi_data['source']} · AQI {aqi_data['aqi']} · "
             f"PM2.5 {aqi_data['pm25']} µg/m³)"
+        )
+    if sec["source"] == "OSM":
+        sources.append(
+            f"güvenlik proxy (OSM · {sec['lamp_count']} lamba · "
+            f"{sec['commercial_count']} ticari node)"
         )
     if osm["source"] == "OSM":
         sources.append(
@@ -201,18 +208,51 @@ async def analyze(req: AnalyzeRequest):
     seismic_risk = _mock_score(lat, lng, "seismic", base=0.40)
     fire_risk    = _mock_score(lat, lng, "fire",    base=0.30)
     infra_risk   = _mock_score(lat, lng, "infra",   base=0.45)
-    risk_score   = round(100 - (flood_risk + seismic_risk + fire_risk + infra_risk) / 4, 1)
+
+    # Güvenlik: OSM proxy (lamba + ticari + issiz alan) ya da mock
+    if sec["score"] is not None:
+        security_score = _blend(sec["score"], _mock_score(lat, lng, "security", base=0.55), weight=0.80)
+        security_src   = "OSM proxy"
+    else:
+        security_score = _mock_score(lat, lng, "security", base=0.55)
+        security_src   = "simüle"
+
+    # Risk skoru: natural hazards inverse + altyapı + güvenlik
+    risk_score = round(
+        (100 - flood_risk + 100 - seismic_risk + 100 - fire_risk
+         + infra_risk + security_score) / 5,
+        1
+    )
 
     risk_details = [
         MetricDetail(label="Sel Riski",              value=flood_risk,
-                     unit="puan", status=_status(100 - flood_risk),  source="simüle"),
+                     unit="puan", status=_status(100 - flood_risk),   source="simüle"),
         MetricDetail(label="Deprem Riski",            value=seismic_risk,
                      unit="puan", status=_status(100 - seismic_risk), source="simüle"),
         MetricDetail(label="Yangın Riski",            value=fire_risk,
-                     unit="puan", status=_status(100 - fire_risk),   source="simüle"),
+                     unit="puan", status=_status(100 - fire_risk),    source="simüle"),
         MetricDetail(label="Altyapı Güvenilirliği",  value=infra_risk,
-                     unit="puan", status=_status(infra_risk),        source="simüle"),
+                     unit="puan", status=_status(infra_risk),         source="simüle"),
+        MetricDetail(label="Güvenlik Endeksi",        value=security_score,
+                     unit="puan", status=_status(security_score),     source=security_src),
     ]
+
+    # OSM güvenlik bileşen detayları
+    if sec["source"] == "OSM":
+        risk_details.append(MetricDetail(
+            label="Aydınlatma Yoğunluğu",
+            value=round(sec["lamp_density"], 1),
+            unit="lamba/km²",
+            status=_status(sec["lamp_score"]),
+            source="OSM",
+        ))
+        risk_details.append(MetricDetail(
+            label="Ticari Yoğunluk",
+            value=round(sec["commercial_density"], 1),
+            unit="node/km²",
+            status=_status(sec["commercial_score"]),
+            source="OSM",
+        ))
 
     # ── Yaşam Uygunluğu ───────────────────────────────────────────────────────
     transport_mock  = _mock_score(lat, lng, "transport", base=0.60)
