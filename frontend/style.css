@@ -390,3 +390,17 @@ kbd {
   .map-wrapper { flex: 1; min-height: 45vh; }
   .topbar-tagline { display: none; }
 }
+
+
+/* ── Grid tooltip ───────────────────────── */
+.grid-tooltip {
+  background: #161b22 !important;
+  border: 1px solid var(--border) !important;
+  color: var(--text) !important;
+  font-size: 11px !important;
+  line-height: 1.6 !important;
+  padding: 6px 10px !important;
+  border-radius: 6px !important;
+  box-shadow: 0 4px 16px rgba(0,0,0,.4) !important;
+}
+.grid-tooltip::before { display: none !important; }

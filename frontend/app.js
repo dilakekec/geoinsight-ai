@@ -8,8 +8,11 @@ const API_BASE = window.location.hostname === "localhost"
 
 // ── State ────────────────────────────────────────────────────────────────────
 let map, currentMarker, radarChart;
-let heatLayer = null;
-let heatVisible = false;
+let heatLayer    = null;
+let heatVisible  = false;
+let gridLayer    = null;
+let gridVisible  = false;
+let gridFetching = false;
 let analysisInFlight = false;
 
 // ── Map Init ─────────────────────────────────────────────────────────────────
@@ -129,6 +132,116 @@ async function toggleHeatmap() {
     btn.classList.remove("active");
     alert("Isı haritası yüklenemedi. Backend çalışıyor mu?");
   }
+}
+
+// ── Grid ──────────────────────────────────────────────────────────────────────
+function _gridColor(score) {
+  if (score >= 70) return "#22c55e";
+  if (score >= 55) return "#84cc16";
+  if (score >= 45) return "#f59e0b";
+  if (score >= 30) return "#f97316";
+  return "#ef4444";
+}
+
+async function fetchAndRenderGrid() {
+  if (gridFetching) return;
+  const btn = document.getElementById("btn-grid");
+  if (!btn) return;
+
+  // Zoom kontrolü: çok uzakta yorumlanamaz
+  if (map.getZoom() < 10) {
+    showGridError("Izgara için haritayı yakınlaştırın (zoom ≥ 10).");
+    return;
+  }
+
+  gridFetching = true;
+  btn.textContent = "⏳ Izgara";
+
+  // Mevcut viewport sınırları
+  const b   = map.getBounds();
+  const url = `${API_BASE}/grid`
+    + `?minlat=${b.getSouth().toFixed(4)}&minlng=${b.getWest().toFixed(4)}`
+    + `&maxlat=${b.getNorth().toFixed(4)}&maxlng=${b.getEast().toFixed(4)}`
+    + `&size=1000`;
+
+  try {
+    const res  = await fetch(url);
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: res.statusText }));
+      throw new Error(err.detail || res.statusText);
+    }
+    const data = await res.json();
+
+    // Eski katmanı kaldır
+    if (gridLayer) { map.removeLayer(gridLayer); gridLayer = null; }
+
+    gridLayer = L.geoJSON(data, {
+      style: f => ({
+        fillColor:   _gridColor(f.properties.overall),
+        fillOpacity: 0.45,
+        color:       "rgba(255,255,255,0.06)",
+        weight:      0.5,
+      }),
+      onEachFeature: (f, layer) => {
+        const p = f.properties;
+        layer.bindTooltip(
+          `<b>Genel: ${p.overall}</b><br>`
+          + `🌿 Yeşil: ${p.green} &nbsp; 🛡 Güvenlik: ${p.security}<br>`
+          + `🚗 Ulaşım: ${p.transport} &nbsp; 💡 Lamba: ${p.lamp}<br>`
+          + `🏪 Ticari: ${p.commerce} &nbsp; 🛣 Yol: ${p.road_km} km`,
+          { className: "grid-tooltip", sticky: true }
+        );
+        layer.on("click", () => {
+          if (!analysisInFlight) analyzeLocation(p.lat, p.lng);
+        });
+      },
+    }).addTo(map);
+
+    gridVisible = true;
+    btn.textContent = "🔲 Izgara (açık)";
+    btn.classList.add("active");
+
+    // Meta bilgi
+    if (data.meta) {
+      console.info(`[Grid] ${data.meta.cell_count} hücre · OSM: ${data.meta.osm_elements} öğe · ort. skor: ${data.meta.score_avg}`);
+    }
+  } catch (err) {
+    showGridError(err.message);
+    btn.textContent = "🔲 Izgara";
+    btn.classList.remove("active");
+    gridVisible = false;
+  } finally {
+    gridFetching = false;
+  }
+}
+
+function showGridError(msg) {
+  const existing = document.getElementById("grid-error");
+  if (existing) existing.remove();
+  const div = document.createElement("div");
+  div.id = "grid-error";
+  div.style.cssText = `
+    position:fixed; bottom:70px; left:50%; transform:translateX(-50%);
+    background:#161b22; border:1px solid rgba(247,129,102,.4);
+    color:#f78166; padding:8px 16px; border-radius:8px;
+    font-size:12px; z-index:9999; pointer-events:none;
+  `;
+  div.textContent = `⚠ ${msg}`;
+  document.body.appendChild(div);
+  setTimeout(() => div.remove(), 4000);
+}
+
+async function toggleGrid() {
+  const btn = document.getElementById("btn-grid");
+  if (gridVisible && gridLayer) {
+    map.removeLayer(gridLayer);
+    gridLayer   = null;
+    gridVisible = false;
+    btn.textContent = "🔲 Izgara";
+    btn.classList.remove("active");
+    return;
+  }
+  await fetchAndRenderGrid();
 }
 
 // ── Panel States ──────────────────────────────────────────────────────────────
@@ -332,7 +445,10 @@ function switchTab(key) {
 function resetAll() {
   if (currentMarker) { map.removeLayer(currentMarker); currentMarker = null; }
   if (heatLayer)     { map.removeLayer(heatLayer);     heatLayer = null; heatVisible = false; }
+  if (gridLayer)     { map.removeLayer(gridLayer);     gridLayer = null; gridVisible = false; }
   document.getElementById("btn-heatmap").classList.remove("active");
+  const bg = document.getElementById("btn-grid");
+  if (bg) { bg.textContent = "🔲 Izgara"; bg.classList.remove("active"); }
   showPanel("panel-idle");
   map.setView([39.2, 35.4], 6, { animate: true });
 
@@ -349,6 +465,8 @@ document.addEventListener("DOMContentLoaded", () => {
 
   document.getElementById("btn-heatmap").addEventListener("click", toggleHeatmap);
   document.getElementById("btn-reset").addEventListener("click", resetAll);
+  const btnGrid = document.getElementById("btn-grid");
+  if (btnGrid) btnGrid.addEventListener("click", toggleGrid);
 
   document.querySelectorAll(".tab").forEach(btn => {
     btn.addEventListener("click", () => switchTab(btn.dataset.tab));

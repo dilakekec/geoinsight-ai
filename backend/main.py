@@ -11,6 +11,7 @@ from kira_loader import kira_data
 from aqi_fetcher import fetch_aqi, _status_pm25
 from security_fetcher import fetch_security
 from traffic_fetcher import fetch_traffic
+from grid_engine import fetch_and_score_grid
 
 
 # ── Uygulama başlangıcında TÜİK verilerini yükle ─────────────────────────────
@@ -394,6 +395,42 @@ async def analyze(req: AnalyzeRequest):
         recommendation=recommendation,
         data_note=data_note,
     )
+
+
+# ── Grid endpoint ────────────────────────────────────────────────────────────
+from fastapi import HTTPException, Query
+
+@app.get("/grid")
+async def grid(
+    minlat: float = Query(..., description="Güney enlem"),
+    minlng: float = Query(..., description="Batı boylam"),
+    maxlat: float = Query(..., description="Kuzey enlem"),
+    maxlng: float = Query(..., description="Doğu boylam"),
+    size:   int   = Query(1000, ge=250, le=2000, description="Hücre boyutu (m)"),
+):
+    """
+    Verilen bbox için grid analizi.
+    Tek Overpass sorgusu → tüm feature'lar Python'da hücrelere dağıtılır.
+
+    Örnek: GET /grid?minlat=40.9&minlng=28.8&maxlat=41.1&maxlng=29.2&size=1000
+    """
+    # Bbox boyutu doğrulama
+    lat_span = maxlat - minlat
+    lng_span = maxlng - minlng
+    if lat_span <= 0 or lng_span <= 0:
+        raise HTTPException(400, "Geçersiz bbox: maxlat > minlat ve maxlng > minlng olmalı.")
+    if lat_span > 0.5 or lng_span > 0.75:
+        raise HTTPException(400,
+            f"Bbox çok büyük ({lat_span:.2f}° × {lng_span:.2f}°). "
+            "Haritayı yakınlaştırın (max ~50km × ~55km).")
+
+    bbox = {"minlat": minlat, "minlng": minlng, "maxlat": maxlat, "maxlng": maxlng}
+    result = await fetch_and_score_grid(bbox, cell_size_m=size)
+
+    if "error" in result:
+        raise HTTPException(422, result["error"])
+
+    return result
 
 
 # ── Heatmap ───────────────────────────────────────────────────────────────────
