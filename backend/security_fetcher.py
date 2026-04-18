@@ -12,19 +12,16 @@ FORMÜL:
            - issiz_alan_penaltisi * 0.20
 
 ────────────────────────────────────────────────────────
-OSM KATMANLARI:
+SORGU MİMARİSİ:
 
-  Aydınlatma      : node["highway"="street_lamp"]
-                    → lambalar/km²
-                    Not: Türkiye'de kapsama oranı değişken;
-                         düşük kapsama → muhafazakâr tahmin
+  Node sayıları için `out count;` kullanılır → sadece sayı döner (~200 byte).
+  İstanbul gibi yoğun bölgelerde node["shop"] sorgusu 30.000+ sonuç verir;
+  tam liste çekmek 30MB+ olur ve maxsize aşımı sessizce boş döner.
 
-  Ticari yoğunluk : node["shop"], node["amenity"]
-                    way["landuse"="commercial|retail"]
-                    → insan varlığı + gözetim proxy'si
-
-  Issız alan      : way["landuse"="industrial|brownfield|wasteland|landfill"]
-                    → toplam alanın %X'ini oluşturuyorsa penaltı
+  3 paralel sorgu:
+    1. node["highway"="street_lamp"] → out count  (lamba sayısı)
+    2. node["shop"] + node["amenity"] → out count  (ticari yoğunluk)
+    3. way["landuse"~commercial|retail|industrial...] → out geom  (alan hesabı)
 
 ────────────────────────────────────────────────────────
 NORMALLEŞTIRME REFERANSları:
@@ -35,13 +32,12 @@ NORMALLEŞTIRME REFERANSları:
 """
 
 import math
+import asyncio
 import httpx
 
 OVERPASS_URL = "https://overpass-api.de/api/interpreter"
 
 # Skor 100 için referans yoğunluklar (birim/km²)  — karekök ölçekleme
-# Gerçek İstanbul merkezi: ~65 lamba/km², ~165 node/km²
-# Referans = üst sınır → bu değerde skor=100 üretir
 _LAMP_REF       = 50.0    # 50 lamba/km²  (√ scaling)
 _COMMERCIAL_REF = 100.0   # 100 node/km²  (√ scaling)
 
@@ -72,28 +68,53 @@ def _polygon_area_m2(nodes: list[dict]) -> float:
     return abs(area) / 2.0
 
 
-def _build_query(lat: float, lng: float, r: int) -> str:
-    return f"""
-[out:json][timeout:45][maxsize:10000000];
-(
-  node["highway"="street_lamp"](around:{r},{lat},{lng});
-  node["shop"](around:{r},{lat},{lng});
-  node["amenity"](around:{r},{lat},{lng});
-  way["landuse"~"^(commercial|retail)$"](around:{r},{lat},{lng});
-  way["landuse"~"^(industrial|brownfield|wasteland|landfill)$"](around:{r},{lat},{lng});
-);
-out geom qt;
-""".strip()
+# ── 3 ayrı hafif sorgu ────────────────────────────────────────────────────────
+
+def _q_lamps(lat: float, lng: float, r: int) -> str:
+    """Sadece lamba sayısı — out count döner (~200 byte)."""
+    return (
+        f'[out:json][timeout:30];'
+        f'node["highway"="street_lamp"](around:{r},{lat},{lng});'
+        f'out count;'
+    )
 
 
-def _parse(elements: list, circle_area_m2: float) -> dict:
+def _q_commercial(lat: float, lng: float, r: int) -> str:
+    """Shop + amenity node sayısı — out count döner (~200 byte)."""
+    return (
+        f'[out:json][timeout:30];'
+        f'(node["shop"](around:{r},{lat},{lng});'
+        f'node["amenity"](around:{r},{lat},{lng}););'
+        f'out count;'
+    )
+
+
+def _q_ways(lat: float, lng: float, r: int) -> str:
+    """Ticari ve ıssız alan wayları — geometri gerekli, ama sayı az."""
+    return (
+        f'[out:json][timeout:30][maxsize:4000000];'
+        f'(way["landuse"~"^(commercial|retail)$"](around:{r},{lat},{lng});'
+        f'way["landuse"~"^(industrial|brownfield|wasteland|landfill)$"](around:{r},{lat},{lng}););'
+        f'out geom qt;'
+    )
+
+
+def _parse_count(data: dict) -> int:
+    """Overpass `out count;` sonucundan toplam sayıyı çıkar."""
+    for el in data.get("elements", []):
+        if el.get("type") == "count":
+            return int(el.get("tags", {}).get("total", 0))
+    return 0
+
+
+def _parse_ways(elements: list) -> tuple[int, float]:
     """
-    Element listesini parse et → bileşen sayıları + alanlar.
+    Way listesinden:
+    - commercial_extra: ticari alan yüzey × 1/2500 m² (node eşdeğeri)
+    - empty_area_m2: ıssız/sanayi alan m²
     """
-    lamp_count       = 0
-    commercial_count = 0
+    commercial_extra = 0
     empty_area_m2    = 0.0
-
     seen: set = set()
 
     for el in elements:
@@ -101,38 +122,32 @@ def _parse(elements: list, circle_area_m2: float) -> dict:
         if eid in seen:
             continue
         seen.add(eid)
+        if el.get("type") != "way":
+            continue
 
-        tags = el.get("tags", {})
-        t    = el.get("type")
-        lu   = tags.get("landuse", "")
+        lu   = el.get("tags", {}).get("landuse", "")
+        geom = el.get("geometry", [])
+        area = _polygon_area_m2(geom)
 
-        if t == "node":
-            if tags.get("highway") == "street_lamp":
-                lamp_count += 1
-            elif "shop" in tags or "amenity" in tags:
-                commercial_count += 1
+        if lu in ("commercial", "retail"):
+            commercial_extra += max(1, int(area / 2500))
+        elif lu in ("industrial", "brownfield", "wasteland", "landfill"):
+            empty_area_m2 += area
 
-        elif t == "way":
-            if lu in ("commercial", "retail"):
-                # Ticari alan way'i → yaklaşık node eşdeğeri
-                area = _polygon_area_m2(el.get("geometry", []))
-                # Her 2500 m² ≈ 1 ticari node (küçük bir dükkan büyüklüğü)
-                commercial_count += max(1, int(area / 2500))
-            elif lu in ("industrial", "brownfield", "wasteland", "landfill"):
-                empty_area_m2 += _polygon_area_m2(el.get("geometry", []))
+    return commercial_extra, empty_area_m2
 
-    circle_area_km2  = circle_area_m2 / 1_000_000
-    lamp_density     = lamp_count / circle_area_km2          # /km²
-    commercial_density = commercial_count / circle_area_km2  # /km²
-    empty_ratio      = min(empty_area_m2 / circle_area_m2, 1.0)
 
-    # Bileşen skorları (0–100) — karekök ölçekleme
-    # √(density/ref) * 100: az veri bölgelerinde daha adil, yoğun bölgelerde daha yavaş artar
+def _score(lamp_count: int, commercial_count: int,
+           empty_area_m2: float, circle_area_m2: float) -> dict:
+    circle_area_km2    = circle_area_m2 / 1_000_000
+    lamp_density       = lamp_count / circle_area_km2
+    commercial_density = commercial_count / circle_area_km2
+    empty_ratio        = min(empty_area_m2 / circle_area_m2, 1.0)
+
     lamp_score       = round(min(math.sqrt(lamp_density / _LAMP_REF) * 100, 100), 1)
     commercial_score = round(min(math.sqrt(commercial_density / _COMMERCIAL_REF) * 100, 100), 1)
-    empty_penalty    = round(empty_ratio * 100, 1)   # %100 boş → 100 puan penaltı
+    empty_penalty    = round(empty_ratio * 100, 1)
 
-    # Ağırlıklı toplam
     raw = (
         lamp_score       * _W_LAMP
         + commercial_score * _W_COMMERCIAL
@@ -141,16 +156,22 @@ def _parse(elements: list, circle_area_m2: float) -> dict:
     score = round(max(5.0, min(95.0, raw)), 1)
 
     return {
-        "lamp_count":        lamp_count,
-        "commercial_count":  commercial_count,
-        "empty_area_m2":     round(empty_area_m2),
-        "lamp_density":      round(lamp_density, 2),
-        "commercial_density":round(commercial_density, 2),
-        "lamp_score":        lamp_score,
-        "commercial_score":  commercial_score,
-        "empty_penalty":     empty_penalty,
-        "score":             score,
+        "lamp_count":          lamp_count,
+        "commercial_count":    commercial_count,
+        "empty_area_m2":       round(empty_area_m2),
+        "lamp_density":        round(lamp_density, 2),
+        "commercial_density":  round(commercial_density, 2),
+        "lamp_score":          lamp_score,
+        "commercial_score":    commercial_score,
+        "empty_penalty":       empty_penalty,
+        "score":               score,
     }
+
+
+async def _post(client: httpx.AsyncClient, query: str) -> dict:
+    resp = await client.post(OVERPASS_URL, data={"data": query})
+    resp.raise_for_status()
+    return resp.json()
 
 
 async def fetch_security(lat: float, lng: float, radius_m: int = 5_000) -> dict:
@@ -172,19 +193,21 @@ async def fetch_security(lat: float, lng: float, radius_m: int = 5_000) -> dict:
         return _cache[key]
 
     circle_area_m2 = math.pi * radius_m ** 2
-    query = _build_query(lat, lng, radius_m)
 
     try:
         async with httpx.AsyncClient(timeout=35.0) as client:
-            resp = await client.post(OVERPASS_URL, data={"data": query})
-            resp.raise_for_status()
-            osm = resp.json()
+            lamp_data, comm_data, ways_data = await asyncio.gather(
+                _post(client, _q_lamps(lat, lng, radius_m)),
+                _post(client, _q_commercial(lat, lng, radius_m)),
+                _post(client, _q_ways(lat, lng, radius_m)),
+            )
 
-        # Overpass bazen HTTP 200 döndürür ama remark ile maxsize aşıldığını bildirir
-        if "remark" in osm and "exceeded" in osm.get("remark", "").lower():
-            raise RuntimeError(f"Overpass maxsize aşıldı: {osm['remark']}")
+        lamp_count        = _parse_count(lamp_data)
+        commercial_nodes  = _parse_count(comm_data)
+        comm_extra, empty = _parse_ways(ways_data.get("elements", []))
+        commercial_count  = commercial_nodes + comm_extra
 
-        result = _parse(osm.get("elements", []), circle_area_m2)
+        result = _score(lamp_count, commercial_count, empty, circle_area_m2)
         result["source"] = "OSM"
 
     except Exception as exc:
