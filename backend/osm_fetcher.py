@@ -65,7 +65,7 @@ def _polygon_area_m2(nodes: list[dict]) -> float:
 
 
 def _build_query(lat: float, lng: float, radius_m: int) -> str:
-    lines = ["[out:json][timeout:30];", "("]
+    lines = ["[out:json][timeout:45][maxsize:6000000];", "("]
     for tag in _GREEN_TAGS:
         lines.append(f'  way{tag}(around:{radius_m},{lat},{lng});')
         lines.append(f'  relation{tag}(around:{radius_m},{lat},{lng});')
@@ -124,6 +124,9 @@ async def fetch_green_coverage(
             resp = await client.post(OVERPASS_URL, data={"data": query})
             resp.raise_for_status()
             osm = resp.json()
+
+        if "remark" in osm and "exceeded" in osm.get("remark", "").lower():
+            raise RuntimeError(f"Overpass maxsize aşıldı: {osm['remark']}")
 
         elements = osm.get("elements", [])
         green_m2 = _parse_elements(elements)

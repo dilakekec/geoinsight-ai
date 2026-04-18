@@ -74,7 +74,7 @@ def _polygon_area_m2(nodes: list[dict]) -> float:
 
 def _build_query(lat: float, lng: float, r: int) -> str:
     return f"""
-[out:json][timeout:30][maxsize:2000000];
+[out:json][timeout:45][maxsize:10000000];
 (
   node["highway"="street_lamp"](around:{r},{lat},{lng});
   node["shop"](around:{r},{lat},{lng});
@@ -179,6 +179,10 @@ async def fetch_security(lat: float, lng: float, radius_m: int = 5_000) -> dict:
             resp = await client.post(OVERPASS_URL, data={"data": query})
             resp.raise_for_status()
             osm = resp.json()
+
+        # Overpass bazen HTTP 200 döndürür ama remark ile maxsize aşıldığını bildirir
+        if "remark" in osm and "exceeded" in osm.get("remark", "").lower():
+            raise RuntimeError(f"Overpass maxsize aşıldı: {osm['remark']}")
 
         result = _parse(osm.get("elements", []), circle_area_m2)
         result["source"] = "OSM"
