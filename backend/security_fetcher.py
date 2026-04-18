@@ -32,7 +32,6 @@ NORMALLEŞTIRME REFERANSları:
 """
 
 import math
-import asyncio
 import httpx
 
 OVERPASS_URL = "https://overpass-api.de/api/interpreter"
@@ -195,12 +194,12 @@ async def fetch_security(lat: float, lng: float, radius_m: int = 5_000) -> dict:
     circle_area_m2 = math.pi * radius_m ** 2
 
     try:
+        # Sıralı istek: 5 eş zamanlı Overpass isteğinden kaçın (rate-limit)
+        # Count sorguları çok hızlı (~<1s) → toplam süreye etkisi minimal
         async with httpx.AsyncClient(timeout=35.0) as client:
-            lamp_data, comm_data, ways_data = await asyncio.gather(
-                _post(client, _q_lamps(lat, lng, radius_m)),
-                _post(client, _q_commercial(lat, lng, radius_m)),
-                _post(client, _q_ways(lat, lng, radius_m)),
-            )
+            lamp_data  = await _post(client, _q_lamps(lat, lng, radius_m))
+            comm_data  = await _post(client, _q_commercial(lat, lng, radius_m))
+            ways_data  = await _post(client, _q_ways(lat, lng, radius_m))
 
         lamp_count        = _parse_count(lamp_data)
         commercial_nodes  = _parse_count(comm_data)
