@@ -26,18 +26,25 @@ async def reverse_geocode(lat: float, lng: float) -> dict:
     if key in _cache:
         return _cache[key]
 
-    try:
-        async with httpx.AsyncClient(headers=HEADERS, timeout=5.0) as client:
-            resp = await client.get(NOMINATIM_URL, params={
-                "lat": lat,
-                "lon": lng,
-                "format": "json",
-                "accept-language": "tr",
-                "zoom": 8,          # il düzeyi
-                "addressdetails": 1,
-            })
-            data = resp.json()
-    except Exception:
+    params = {
+        "lat": lat, "lon": lng,
+        "format": "json",
+        "accept-language": "tr",
+        "zoom": 8,
+        "addressdetails": 1,
+    }
+    data = {}
+    for attempt in range(2):   # 1 yeniden deneme
+        try:
+            async with httpx.AsyncClient(headers=HEADERS, timeout=12.0) as client:
+                resp = await client.get(NOMINATIM_URL, params=params)
+                resp.raise_for_status()
+                data = resp.json()
+                break
+        except Exception:
+            if attempt == 0:
+                await asyncio.sleep(1)  # kısa bekleme, sonra tekrar dene
+    if not data:
         return {}
 
     address = data.get("address", {})
